@@ -1,7 +1,7 @@
-#!/bin/sh
+#!/bin/bash
 
 # Check script dependencies
-for command in http jq
+for command in curl jq
 do
     if ! hash $command 2>/dev/null; then
         echo $command is not available, please install $command
@@ -69,15 +69,21 @@ vault write root-ca/config/urls issuing_certificates="http://vault:8200/v1/root-
 vault mount -path=intermediate-ca -max-lease-ttl=43800h pki
 
 # Generate a Certificate Signing Request: 
-http POST http://127.0.0.1:8200/v1/intermediate-ca/intermediate/generate/internal X-Vault-Token:vault-root-token \
-    common_name="Intermediate CA" ttl=43800h exclude_cn_from_sans=true | jq -r .data.csr > intermediate.csr
+csrfile=intermediate.csr
+curl -X POST -H X-Vault-Token:vault-root-token -H Content-Type:application/json -d '{"common_name":"Intermediate CA","ttl":"43800h", "exclude_cn_from_sans":"true"}' http://127.0.0.1:8200/v1/intermediate-ca/intermediate/generate/internal \
+    | jq -r .data.csr > $csrfile
 
 #Ask the Root to sign it: 
-http POST http://127.0.0.1:8200/v1/root-ca/root/sign-intermediate X-Vault-Token:vault-root-token csr=@intermediate.csr \
-    use_csr_values=true exclude_cn_from_sans=true | jq -r .data.certificate > signed.crt
+signedfile=signed.crt
+curl -X POST -H "X-Vault-Token:vault-root-token" -H "Content-Type:application/json" \
+ -d @<(jq -n \
+  --arg a "$(<$csrfile)" \
+   '{csr: $a, common_name: "Intermediate CA", use_csr_values: "true", exclude_cn_from_sans: "true"}') \
+ http://127.0.0.1:8200/v1/root-ca/root/sign-intermediate \
+ | jq -r .data.certificate > $signedfile
 
 # Send the stored certificate back to Vault: 
-vault write intermediate-ca/intermediate/set-signed certificate=@signed.crt
+vault write intermediate-ca/intermediate/set-signed certificate=@$signedfile
 
 #Set up URLs: 
 vault write intermediate-ca/config/urls issuing_certificates="http://vault:8200/v1/intermediate-ca/ca" \
@@ -108,15 +114,15 @@ vault write auth/token/roles/kubernetes-vault allowed_policies=kubernetes-vault 
 
 #Generate the token: 
 #vault token-create -role=kubernetes-vault
-CLIENTTOKEN=$(http POST http://127.0.0.1:8200/v1/auth/token/create/kubernetes-vault \
-    X-Vault-Token:vault-root-token | jq -r .auth.client_token)
+CLIENTTOKEN=$(curl -X POST -H X-Vault-Token:vault-root-token http://127.0.0.1:8200/v1/auth/token/create/kubernetes-vault \
+     | jq -r .auth.client_token)
 sed -i -e "s/token\: .*$/token: $CLIENTTOKEN/g" kubernetes-vault.yaml
 
 #Get the AppID: 
 #vault read auth/approle/role/sample-app/role-id
-ROLEID=$(http GET http://127.0.0.1:8200/v1/auth/approle/role/sample-app/role-id \
-    X-Vault-Token:vault-root-token | jq -r .data.role_id)
-sed -i -e "s/value\"\: \".*$/value\": \"$ROLEID\"/g" sample-app.yaml
+ROLEID=$(curl -X GET -H X-Vault-Token:vault-root-token http://127.0.0.1:8200/v1/auth/approle/role/sample-app/role-id \
+    | jq -r .data.role_id)
+sed -i -e "s/value\: .*$/value: $ROLEID/g" sample-app.yaml
 
 #3. Deploy Kubernetes-Vault
 
